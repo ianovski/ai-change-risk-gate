@@ -1,0 +1,188 @@
+name: PR Risk Gate
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+      - ready_for_review
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  evaluate:
+    if: ${{ !github.event.pull_request.draft && vars.RISK_GATE_URL != '' && vars.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.GCP_SERVICE_ACCOUNT != '' }}
+    runs-on: ubuntu-latest
+    env:
+      RISK_GATE_URL: ${{ vars.RISK_GATE_URL }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+      RISK_GATE_FAIL_ON: ${{ vars.RISK_GATE_FAIL_ON || 'block,require_approval' }}
+    steps:
+      - name: Authenticate to Google Cloud
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+          token_format: id_token
+          id_token_audience: ${{ env.RISK_GATE_URL }}
+
+      - name: Build risk evaluation payload
+        id: payload
+        uses: actions/github-script@v7
+        with:
+          result-encoding: string
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner,
+              repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const changedPaths = files.map((file) => file.filename);
+            const linesAdded = files.reduce((sum, file) => sum + file.additions, 0);
+            const linesDeleted = files.reduce((sum, file) => sum + file.deletions, 0);
+
+            const lowerPaths = changedPaths.map((path) => path.toLowerCase());
+            const body = (pr.body || '').toLowerCase();
+
+            const hasTests = lowerPaths.some((path) => {
+              return path.includes('/test/') || path.includes('/tests/') || path.includes('__tests__/') || /(^|\/)(test|tests|spec|specs)\./.test(path) || /(\.test\.|\.spec\.)/.test(path);
+            });
+
+            const hasIntegrationTests = lowerPaths.some((path) => {
+              return path.includes('integration') || path.includes('e2e') || path.includes('smoke');
+            });
+
+            const payload = {
+              repo: `${owner}/${repo}`,
+              branch: pr.base.ref,
+              commit_sha: pr.head.sha,
+              files_changed: files.length,
+              lines_added: linesAdded,
+              lines_deleted: linesDeleted,
+              changed_paths: changedPaths,
+              has_rollback_plan: body.includes('rollback plan') || body.includes('rollback:'),
+              has_tests: hasTests,
+              has_integration_tests: hasIntegrationTests,
+              author_recent_failure_rate: 0,
+              deployment_window_critical: false,
+            };
+
+            core.setOutput('pr_number', String(pr.number));
+            core.setOutput('payload', JSON.stringify(payload));
+            return JSON.stringify(payload, null, 2);
+
+      - name: Call risk gate
+        id: risk_gate
+        env:
+          ID_TOKEN: ${{ steps.auth.outputs.id_token }}
+          PAYLOAD_JSON: ${{ steps.payload.outputs.payload }}
+        run: |
+          set -euo pipefail
+          http_code=$(curl -sS -o response.json -w '%{http_code}' \
+            -X POST "${RISK_GATE_URL}/v1/risk/evaluate" \
+            -H "Authorization: Bearer ${ID_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            --data "${PAYLOAD_JSON}")
+          if [[ "${http_code}" -lt 200 || "${http_code}" -gt 299 ]]; then
+            echo "Risk gate request failed with HTTP ${http_code}" >&2
+            cat response.json >&2
+            exit 1
+          fi
+
+      - name: Summarize result
+        id: summarize
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          data = json.loads(Path('response.json').read_text())
+          fail_on = {item.strip() for item in os.environ['RISK_GATE_FAIL_ON'].split(',') if item.strip()}
+          decision = data['effective_decision']
+          should_fail = str(decision in fail_on).lower()
+          reasons = data.get('reasons', [])
+
+          summary = []
+          summary.append('## AI Change Risk Gate')
+          summary.append('')
+          summary.append(f"- Risk score: {data['risk_score']}")
+          summary.append(f"- Risk level: {data['risk_level']}")
+          summary.append(f"- Suggested decision: {data['suggested_decision']}")
+          summary.append(f"- Effective decision: {decision}")
+          if data.get('approval_id'):
+            summary.append(f"- Approval ID: {data['approval_id']}")
+          if reasons:
+            summary.append('')
+            summary.append('Reasons:')
+            for reason in reasons:
+              summary.append(f"- {reason}")
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as handle:
+            handle.write('\n'.join(summary) + '\n')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as handle:
+            handle.write(f"decision={decision}\n")
+            handle.write(f"should_fail={should_fail}\n")
+            handle.write("comment<<EOF\n")
+            handle.write('\n'.join(summary) + '\n')
+            handle.write("EOF\n")
+          PY
+
+      - name: Upsert PR comment
+        uses: actions/github-script@v7
+        env:
+          COMMENT_BODY: ${{ steps.summarize.outputs.comment }}
+          PR_NUMBER: ${{ steps.payload.outputs.pr_number }}
+        with:
+          script: |
+            const body = process.env.COMMENT_BODY;
+            const prNumber = Number(process.env.PR_NUMBER);
+            const marker = '## AI Change Risk Gate';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            const existing = comments.find((comment) => {
+              return comment.user?.type === 'Bot' && comment.body?.includes(marker);
+            });
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body,
+            });
+
+      - name: Enforce gate decision
+        if: ${{ steps.summarize.outputs.should_fail == 'true' }}
+        run: |
+          echo "PR blocked by AI Change Risk Gate decision: ${{ steps.summarize.outputs.decision }}" >&2
+          exit 1
